@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Binance.US Momentum Bot (Ross-style) — multi-coin USDT scanner, partial @ +1R, ATR trail, SQLite
-# Fixed version: entrypoint + loop, kline limit guard, ATR/NaN guards, safer qty calc, missing-keys handling, robust logging.
+# Timezone-safe version: all datetimes are timezone-aware UTC. No utcnow() deprecations.
 
 import os
 import time
@@ -9,7 +9,7 @@ import hashlib
 import sqlite3
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import requests
@@ -123,7 +123,7 @@ class DB:
     def log_equity(self, val: float) -> None:
         self.conn.execute(
             "REPLACE INTO equity_log(ts,equity) VALUES(?,?)",
-            (datetime.utcnow().isoformat(), val),
+            (datetime.now(timezone.utc).isoformat(), val),
         )
         self.conn.commit()
 
@@ -216,7 +216,7 @@ def df_from_klines(rows: List[List]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=cols)
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["ts"] = pd.to_datetime(df["close_time"], unit="ms")
+    df["ts"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     df.set_index("ts", inplace=True)
     return df[["open", "high", "low", "close", "volume"]]
 
@@ -302,9 +302,10 @@ def news_boost(symbol: str) -> bool:
             timeout=10,
         )
         j = r.json()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for p in j.get("results", []):
-            ts = datetime.fromisoformat(p["published_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+            # published_at like "2025-08-09T15:20:00Z"
+            ts = datetime.fromisoformat(p["published_at"].replace("Z", "+00:00")).astimezone(timezone.utc)
             if (now - ts) <= timedelta(hours=2):
                 return True
     except Exception:
@@ -429,11 +430,6 @@ def size_from_risk(acct: Account, entry: float, stop: float, step: float, minNot
     return qty
 
 # ===== Position management =====
-@dataclass
-class _DummyMeta:  # (placeholder in case meta is missing keys)
-    step: float = 0.000001
-    minNotional: float = 10.0
-
 def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -> None:
     to_close: List[str] = []
     for sym, pos in list(acct.open.items()):
@@ -448,8 +444,12 @@ def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -
             pnl = (px - pos.entry) * sz
             print(f"[EXIT-STOP] {sym} qty={sz} @~{px:.8f} pnl={pnl:.2f} {'DRY' if KILL_SWITCH else ''} resp={resp}")
             acct.equity += pnl
-            db.ins_trade(f"{sym}-{int(time.time())}", sym, "sell", pos.entry, px, sz, pnl,
-                         pos.opened_at.isoformat() if pos.opened_at else "", datetime.utcnow().isoformat())
+            db.ins_trade(
+                f"{sym}-{int(time.time())}",
+                sym, "sell", pos.entry, px, sz, pnl,
+                pos.opened_at.isoformat() if pos.opened_at else "",
+                datetime.now(timezone.utc).isoformat()
+            )
             db.del_pos(sym)
             to_close.append(sym)
             continue
@@ -464,10 +464,13 @@ def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -
             acct.equity += pnl
             pos.size -= sell_sz
             pos.partial_taken = True
+            # move stop to breakeven after partial
             pos.stop = max(pos.stop, pos.entry)
-            db.upsert_pos(sym, pos.size, pos.entry, pos.stop, pos.take,
-                          pos.opened_at.isoformat() if pos.opened_at else datetime.utcnow().isoformat(),
-                          pos.partial_taken, pos.trailing)
+            db.upsert_pos(
+                sym, pos.size, pos.entry, pos.stop, pos.take,
+                pos.opened_at.isoformat() if pos.opened_at else datetime.now(timezone.utc).isoformat(),
+                pos.partial_taken, pos.trailing
+            )
 
         # Begin/adjust trailing after partial
         if pos.partial_taken:
@@ -478,9 +481,11 @@ def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -
                 if new_stop > pos.stop:
                     pos.stop = new_stop
                     pos.trailing = True
-                    db.upsert_pos(sym, pos.size, pos.entry, pos.stop, pos.take,
-                                  pos.opened_at.isoformat() if pos.opened_at else datetime.utcnow().isoformat(),
-                                  pos.partial_taken, pos.trailing)
+                    db.upsert_pos(
+                        sym, pos.size, pos.entry, pos.stop, pos.take,
+                        pos.opened_at.isoformat() if pos.opened_at else datetime.now(timezone.utc).isoformat(),
+                        pos.partial_taken, pos.trailing
+                    )
 
     for sym in to_close:
         acct.open.pop(sym, None)
@@ -497,11 +502,11 @@ def run_scan_and_trade():
     print(f"[INIT] symbols={len(meta)}  kill={KILL_SWITCH}  risk={RISK_PER_TRADE:.2%} minNotional~10")
 
     cooldown_until: Optional[datetime] = None
-    last_day = datetime.utcnow().date()
+    last_day = datetime.now(timezone.utc).date()
 
     while True:
         try:
-            now_day = datetime.utcnow().date()
+            now_day = datetime.now(timezone.utc).date()
             if now_day != last_day:
                 acct.day_start = acct.equity
                 db.set("day_start", acct.day_start)
@@ -511,13 +516,13 @@ def run_scan_and_trade():
             db.log_equity(acct.equity)
 
             if acct.daily_dd() >= DAILY_MAX_DD:
-                if not cooldown_until or datetime.utcnow() >= cooldown_until:
-                    cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MIN)
-                    print(f"[RISK] daily DD {acct.daily_dd():.2%} reached. Cooling until {cooldown_until} UTC")
+                if not cooldown_until or datetime.now(timezone.utc) >= cooldown_until:
+                    cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MIN)
+                    print(f"[RISK] daily DD {acct.daily_dd():.2%} reached. Cooling until {cooldown_until.isoformat()}")
                 time.sleep(1)
                 continue
 
-            if cooldown_until and datetime.utcnow() < cooldown_until:
+            if cooldown_until and datetime.now(timezone.utc) < cooldown_until:
                 time.sleep(1)
                 continue
             else:
@@ -546,7 +551,7 @@ def run_scan_and_trade():
                 print(f"[BUY] {sym} qty={qty} @~{entry:.8f} stop={stop:.8f} {'DRY' if KILL_SWITCH else ''} resp={resp}")
 
                 take = entry + PARTIAL_AT_R * (entry - stop)
-                pos = Pos(size=qty, entry=entry, stop=stop, take=take, opened_at=datetime.utcnow())
+                pos = Pos(size=qty, entry=entry, stop=stop, take=take, opened_at=datetime.now(timezone.utc))
                 acct.open[sym] = pos
                 db.upsert_pos(sym, pos.size, pos.entry, pos.stop, pos.take, pos.opened_at.isoformat(), False, False)
 
