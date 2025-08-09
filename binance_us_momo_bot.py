@@ -1,3 +1,4 @@
+print("[BOOT] starting bot...")
 #!/usr/bin/env python3
 # Binance.US Momentum Bot (Ross-style) — multi-coin USDT scanner, partial @ +1R, ATR trail, SQLite
 
