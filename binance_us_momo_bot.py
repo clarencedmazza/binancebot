@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # Binance.US Momentum Bot (Ross-style) — multi-coin USDT scanner, partial @ +1R, ATR trail, SQLite
-# Safe+fixed version: entrypoint + loop, kline limit guard, ATR/NaN guards, safer qty calc, missing-keys handling.
+# Fixed version: entrypoint + loop, kline limit guard, ATR/NaN guards, safer qty calc, missing-keys handling, robust logging.
 
 import os
 import time
 import hmac
 import hashlib
-import json
 import sqlite3
 import math
 from dataclasses import dataclass, field
@@ -24,7 +23,6 @@ MAX_KLINE_LIMIT = 1000
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "momo-bus/1.2"})
-SESSION.timeout = 15
 
 BUSA_API_KEY = os.getenv("BUSA_API_KEY")
 BUSA_API_SECRET = os.getenv("BUSA_API_SECRET")
@@ -48,7 +46,6 @@ DAILY_MAX_DD = float(os.getenv("DAILY_MAX_DD", "0.05"))               # 5% max d
 COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "5"))
 START_CAPITAL = float(os.getenv("START_CAPITAL", "100"))
 LOOP_SLEEP = int(os.getenv("LOOP_SLEEP", "10"))                       # seconds between scans
-MGR_SLEEP = int(os.getenv("MGR_SLEEP", "5"))                          # seconds between position mgmt passes
 
 # ===== SQLite =====
 SCHEMA = """
@@ -154,7 +151,7 @@ def priv_post(path: str, params: Dict[str, str]) -> Tuple[int, Any]:
     )
     ct = r.headers.get("Content-Type", "")
     try:
-        body = r.json() if "application/json" in ct else r.text
+        body = r.json() if ct and "application/json" in ct else r.text
     except Exception:
         body = r.text
     return r.status_code, body
@@ -186,12 +183,18 @@ def usdt_symbols(info: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
         for f in s.get("filters", []):
             ftype = f.get("filterType")
             if ftype == "LOT_SIZE":
-                step = float(f.get("stepSize", step)) or step
-                min_qty = float(f.get("minQty", min_qty)) or min_qty
+                try:
+                    step = float(f.get("stepSize", step)) or step
+                    min_qty = float(f.get("minQty", min_qty)) or min_qty
+                except Exception:
+                    pass
             if ftype in ("NOTIONAL", "MIN_NOTIONAL"):
-                mn = float(f.get("minNotional", min_notional)) if f.get("minNotional") else min_notional
-                if mn > 0:
-                    min_notional = mn
+                try:
+                    mn = float(f.get("minNotional", min_notional)) if f.get("minNotional") else min_notional
+                    if mn > 0:
+                        min_notional = mn
+                except Exception:
+                    pass
         out[sym] = {"step": step, "minQty": min_qty, "minNotional": min_notional}
     return out
 
@@ -379,7 +382,6 @@ def candidate_symbols(meta: Dict[str, Dict[str, float]]) -> List[str]:
         try:
             t = ticker24(s)
             chg = float(t.get("priceChangePercent", "0") or 0.0)
-            # use quoteVolume if available; fallback to volume
             vol = float(t.get("quoteVolume") or t.get("volume") or 0.0)
         except Exception:
             chg, vol = 0.0, 0.0
@@ -427,6 +429,11 @@ def size_from_risk(acct: Account, entry: float, stop: float, step: float, minNot
     return qty
 
 # ===== Position management =====
+@dataclass
+class _DummyMeta:  # (placeholder in case meta is missing keys)
+    step: float = 0.000001
+    minNotional: float = 10.0
+
 def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -> None:
     to_close: List[str] = []
     for sym, pos in list(acct.open.items()):
@@ -457,7 +464,6 @@ def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -
             acct.equity += pnl
             pos.size -= sell_sz
             pos.partial_taken = True
-            # move stop to breakeven after partial
             pos.stop = max(pos.stop, pos.entry)
             db.upsert_pos(sym, pos.size, pos.entry, pos.stop, pos.take,
                           pos.opened_at.isoformat() if pos.opened_at else datetime.utcnow().isoformat(),
@@ -465,7 +471,6 @@ def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -
 
         # Begin/adjust trailing after partial
         if pos.partial_taken:
-            # simple ATR trail on closes
             k1 = df_from_klines(klines(sym, "1m", limit=60))
             atr = safe_last_atr(k1, 14)
             if atr and atr > 0:
@@ -483,7 +488,6 @@ def manage_positions(db: DB, acct: Account, meta: Dict[str, Dict[str, float]]) -
 # ===== Main loop =====
 def run_scan_and_trade():
     db = DB()
-    # load persisted equity/day_start or set defaults
     equity = float(db.get("equity", START_CAPITAL))
     day_start = float(db.get("day_start", START_CAPITAL))
     acct = Account(equity=equity, day_start=day_start)
@@ -497,7 +501,6 @@ def run_scan_and_trade():
 
     while True:
         try:
-            # reset day_start on new UTC day
             now_day = datetime.utcnow().date()
             if now_day != last_day:
                 acct.day_start = acct.equity
@@ -505,10 +508,8 @@ def run_scan_and_trade():
                 last_day = now_day
                 print(f"[ROLLOVER] New UTC day. day_start={acct.day_start:.2f}")
 
-            # equity logging
             db.log_equity(acct.equity)
 
-            # drawdown guard
             if acct.daily_dd() >= DAILY_MAX_DD:
                 if not cooldown_until or datetime.utcnow() >= cooldown_until:
                     cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MIN)
@@ -516,18 +517,15 @@ def run_scan_and_trade():
                 time.sleep(1)
                 continue
 
-            # cooldown in effect?
             if cooldown_until and datetime.utcnow() < cooldown_until:
                 time.sleep(1)
                 continue
             else:
                 cooldown_until = None
 
-            # 1) Scan
             picks = candidate_symbols(meta)
             print(f"[SCAN] top={', '.join(picks)}")
 
-            # 2) Entry logic
             for sym in picks:
                 if len(acct.open) >= MAX_OPEN_TRADES:
                     break
@@ -547,5 +545,32 @@ def run_scan_and_trade():
                 ok, resp = place_market_buy(sym, qty)
                 print(f"[BUY] {sym} qty={qty} @~{entry:.8f} stop={stop:.8f} {'DRY' if KILL_SWITCH else ''} resp={resp}")
 
-                # set
+                take = entry + PARTIAL_AT_R * (entry - stop)
+                pos = Pos(size=qty, entry=entry, stop=stop, take=take, opened_at=datetime.utcnow())
+                acct.open[sym] = pos
+                db.upsert_pos(sym, pos.size, pos.entry, pos.stop, pos.take, pos.opened_at.isoformat(), False, False)
+
+            manage_positions(db, acct, meta)
+            db.set("equity", acct.equity)
+            time.sleep(LOOP_SLEEP)
+
+        except requests.HTTPError as e:
+            print(f"[HTTP] {e}")
+            time.sleep(3)
+        except Exception as e:
+            import traceback
+            print(f"[LOOP-ERR] {type(e).__name__}: {e}")
+            traceback.print_exc()
+            time.sleep(3)
+
+# ===== Entrypoint =====
+if __name__ == "__main__":
+    try:
+        run_scan_and_trade()
+    except KeyboardInterrupt:
+        print("\n[EXIT] KeyboardInterrupt")
+    except Exception as e:
+        import traceback
+        print(f"[FATAL] {type(e).__name__}: {e}")
+        traceback.print_exc()
 
