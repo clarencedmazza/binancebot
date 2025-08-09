@@ -382,4 +382,9 @@ def size_from_risk(acct: Account, entry: float, stop: float, step: float, minNot
     risk_per_unit = max(1e-9, entry - stop)
     qty = risk_usd / risk_per_unit
     qty = round_step(qty, step)
-    if qty * entry
+    if qty * entry < minNotional:
+        qty = math.ceil(minNotional / entry / step) * step
+    return qty
+
+
+
