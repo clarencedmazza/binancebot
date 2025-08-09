@@ -1,1 +1,1 @@
-worker: python -u -c "import os,time; print('HELLO'); print('FILES', os.listdir('.')); time.sleep(600)"
+worker: python -u binance_us_momo_bot.py --live
