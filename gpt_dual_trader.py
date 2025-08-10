@@ -177,12 +177,15 @@ def call_llm(system_prompt: str, context: Dict[str, Any]) -> Optional[Dict[str, 
     try:
         r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=40)
         r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        data = json.loads(content)  # must be pure JSON
-        if not isinstance(data, dict): return None
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        # Extract only the JSON block if extra text appears
+        raw_json = raw[raw.find("{"): raw.rfind("}")+1]
+        data = json.loads(raw_json)
+        if not isinstance(data, dict):
+            return None
         return data
     except Exception as e:
-        print(f"[LLM] {e}")
+        print(f"[LLM] parse error: {e} raw={raw if 'raw' in locals() else 'N/A'}")
         return None
 
 # ---- Context builder ----
