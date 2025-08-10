@@ -1,0 +1,7 @@
+STRATEGY_PROMPT = os.getenv("STRATEGY_PROMPT", "")
+if not STRATEGY_PROMPT:
+    try:
+        with open("prompt.txt", "r", encoding="utf-8") as f:
+            STRATEGY_PROMPT = f.read()
+    except FileNotFoundError:
+        pass
