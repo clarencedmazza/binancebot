@@ -172,7 +172,16 @@ def call_llm(system_prompt: str, context: Dict[str, Any]) -> Optional[Dict[str, 
     if not OPENAI_API_KEY:
         print("[LLM] missing OPENAI_API_KEY")
         return None
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+    # Clean None values before sending
+    for k, v in list(context.items()):
+        if v is None:
+            context[k] = "null"
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
     body = {
         "model": LLM_MODEL,
         "messages": [
