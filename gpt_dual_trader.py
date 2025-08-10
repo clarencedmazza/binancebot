@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # GPT-driven Binance.US trader — BTCUSDT & ETHUSDT, long-only, spot.
-# - Pulls 1h/4h context, prompts GPT, validates guardrails, executes orders.
-# - Dry by default (KILL_SWITCH=1). Flip to 0 when ready.
+# Dry by default (KILL_SWITCH=1). Flip to 0 when ready.
 
 import os, time, hmac, hashlib, json, math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-
 import requests
 
 BASE = "https://api.binance.us"
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "gpt-dual-trader/1.0"})
+SESSION.headers.update({"User-Agent": "gpt-dual-trader/1.1"})
 
 # ---- Env ----
 BUSA_API_KEY    = os.getenv("BUSA_API_KEY")
@@ -69,21 +67,15 @@ def ema(vals: List[float], span: int) -> Optional[float]:
         e = v * k + e * (1 - k)
     return float(e)
 
-def sma(vals: List[float], n: int) -> Optional[float]:
-    if len(vals) < n or n <= 0: return None
-    return sum(vals[-n:]) / n
-
 def atr_ohlc(h: List[float], l: List[float], c: List[float], n: int = 14) -> Optional[float]:
     if len(h) < n + 1 or len(l) < n + 1 or len(c) < n + 1: return None
     trs = []
     for i in range(1, len(h)):
-        tr = max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
-        trs.append(tr)
+        trs.append(max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])))
     if len(trs) < n: return None
     return sum(trs[-n:]) / n
 
 def vwap_from_klines(kl: List[List], use_len: int = 120) -> Optional[float]:
-    # approximate VWAP using close*volume over last N bars
     closes = [float(r[4]) for r in kl][-use_len:]
     vols   = [float(r[5]) for r in kl][-use_len:]
     if not closes or not vols or len(closes) != len(vols): return None
@@ -152,8 +144,7 @@ def fetch_symbol_meta(symbols: List[str]) -> Dict[str, Dict[str, float]]:
         for f in s.get("filters", []):
             t = f.get("filterType")
             if t == "LOT_SIZE":
-                try:
-                    step = float(f.get("stepSize", step)) or step
+                try: step = float(f.get("stepSize", step)) or step
                 except: pass
             if t in ("NOTIONAL","MIN_NOTIONAL"):
                 try:
@@ -203,7 +194,6 @@ def build_context(symbol: str) -> Dict[str, Any]:
     c1 = [float(r[4]) for r in k1h]
     h1 = [float(r[2]) for r in k1h]
     l1 = [float(r[3]) for r in k1h]
-    v1 = [float(r[5]) for r in k1h]
     c4 = [float(r[4]) for r in k4h]
 
     ema50_1h  = ema(c1, 50)
@@ -226,8 +216,8 @@ def build_context(symbol: str) -> Dict[str, Any]:
         "dry_run": KILL_SWITCH, "ts": utcnow_iso()
     }
 
-# ---- Validation & execution ----
-def enforce_guardrails(dec: Dict[str, Any], meta: Dict[str, Dict[str, float]], ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+# ---- Validation & execution prep ----
+def prepare_execution(dec: Dict[str, Any], meta: Dict[str, Dict[str, float]], ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # required keys
     req = ["action","symbol","entry_type","entry_price","amount_usdt","risk_pct","stop_loss","take_profit","confidence","reason"]
     if any(k not in dec for k in req):
@@ -242,49 +232,125 @@ def enforce_guardrails(dec: Dict[str, Any], meta: Dict[str, Dict[str, float]], c
     if action not in ("buy","sell","hold"):
         print("[GUARD] invalid action")
         return None
-    # long-only
-    if action == "sell" and (ctx["have_asset"] or 0.0) <= 0.0:
-        print("[GUARD] no holdings to sell -> HOLD")
-        dec["action"] = "hold"; action = "hold"
 
     conf = float(dec.get("confidence", 0.0))
     if conf < CONF_THRESHOLD:
         print(f"[GUARD] confidence {conf:.2f} < {CONF_THRESHOLD:.2f}")
         return None
 
-    # stop risk checks for BUY
-    if action == "buy":
-        price = float(ctx["price"])
-        stop  = float(dec["stop_loss"])
-        if stop >= price:
-            print("[GUARD] stop not below entry")
-            return None
-        stop_dist_pct = (price - stop) / price * 100.0
-        if stop_dist_pct > 3.0:
-            print(f"[GUARD] stop distance {stop_dist_pct:.2f}% > 3%")
-            return None
-        take = float(dec["take_profit"])
-        rr = (take - price) / max(price - stop, 1e-9)
-        if rr < 1.8:
-            print(f"[GUARD] RR {rr:.2f} < 1.8")
-            return None
+    price = float(ctx["price"])
+    step = meta.get(symbol, {}).get("step", 0.000001)
+    min_notional = meta.get(symbol, {}).get("minNotional", 10.0)
 
-        # regime check (bullish only)
-        if not (ctx["ema50_1h"] and ctx["ema200_1h"] and ctx["ema50_4h"] and ctx["ema200_4h"] and ctx["vwap_1h"]):
-            print("[GUARD] missing regime indicators")
+    if action == "sell":
+        if (ctx["have_asset"] or 0.0) <= 0.0:
+            print("[GUARD] no holdings to sell")
             return None
-        if not (ctx["ema50_1h"] > ctx["ema200_1h"] and ctx["price"] >= ctx["vwap_1h"] and ctx["ema50_4h"] > ctx["ema200_4h"]):
-            print("[GUARD] regime not bullish")
+        qty = round_step(float(ctx["have_asset"]), step)
+        if qty * price < min_notional or qty <= 0:
+            print("[GUARD] notional too small to sell")
             return None
+        return {"action":"sell","symbol":symbol,"qty":qty}
 
-        # sizing
-        risk_pct = max(0.2, min(float(dec["risk_pct"]), MAX_RISK_PCT))
-        avail_usdt = float(ctx["have_usdt"])
-        max_usdt = min(avail_usdt, USDT_CAP)
-        # If amount_usdt provided, cap it; else compute from risk and stop distance
-        amt_usdt = dec["amount_usdt"]
-        if amt_usdt is None:
-            risk_usdt = max_usdt * (risk_pct / 100.0)
-            risk_per_unit = price - stop
+    if action == "hold":
+        return {"action":"hold","symbol":symbol}
+
+    # BUY checks
+    stop  = float(dec["stop_loss"])
+    take  = float(dec["take_profit"])
+    if stop >= price:
+        print("[GUARD] stop not below entry")
+        return None
+    stop_dist_pct = (price - stop) / max(price, 1e-9) * 100.0
+    if stop_dist_pct > 3.0:
+        print(f"[GUARD] stop distance {stop_dist_pct:.2f}% > 3%")
+        return None
+    rr = (take - price) / max(price - stop, 1e-9)
+    if rr < 1.8:
+        print(f"[GUARD] RR {rr:.2f} < 1.8")
+        return None
+
+    # bullish regime
+    if not (ctx["ema50_1h"] and ctx["ema200_1h"] and ctx["ema50_4h"] and ctx["ema200_4h"] and ctx["vwap_1h"]):
+        print("[GUARD] missing regime indicators")
+        return None
+    if not (ctx["ema50_1h"] > ctx["ema200_1h"] and price >= ctx["vwap_1h"] and ctx["ema50_4h"] > ctx["ema200_4h"]):
+        print("[GUARD] regime not bullish")
+        return None
+
+    # sizing
+    avail_usdt = float(ctx["have_usdt"])
+    max_usdt = min(avail_usdt, USDT_CAP)
+    risk_pct = max(0.2, min(float(dec["risk_pct"]), MAX_RISK_PCT))  # percentage
+    amt_usdt = dec["amount_usdt"]
+
+    if amt_usdt is None:
+        risk_usdt = max_usdt * (risk_pct / 100.0)
+        risk_per_unit = price - stop
+        if risk_per_unit <= 0:
+            print("[GUARD] invalid risk per unit")
+            return None
+        qty = risk_usdt / risk_per_unit
+        # cap by max_usdt
+        qty = min(qty, max_usdt / max(price, 1e-9))
+    else:
+        qty = float(amt_usdt) / max(price, 1e-9)
+        qty = min(qty, max_usdt / max(price, 1e-9))
+
+    qty = round_step(qty, step)
+    if qty * price < min_notional or qty <= 0:
+        print(f"[GUARD] notional too small: qty={qty} notional={qty*price:.2f} < {min_notional}")
+        return None
+
+    return {"action":"buy","symbol":symbol,"qty":qty}
+
+# ---- Main loop ----
+def main():
+    print(f"[BOOT] GPT trader starting — symbols={SYMBOLS} dry={KILL_SWITCH} conf>={CONF_THRESHOLD} loop={LOOP_SEC}s")
+    if not STRATEGY_PROMPT:
+        print("[FATAL] STRATEGY_PROMPT missing"); return
+    if not OPENAI_API_KEY:
+        print("[WARN] OPENAI_API_KEY missing (decisions will fail)")
+    meta = fetch_symbol_meta(SYMBOLS)
+    if not meta:
+        print("[WARN] exchange info/meta empty; will still attempt trading")
+
+    while True:
+        try:
+            for sym in SYMBOLS:
+                ctx = build_context(sym)
+                dec = call_llm(STRATEGY_PROMPT, ctx)
+                if not dec:
+                    print(f"[LLM] no/invalid decision for {sym}")
+                    continue
+
+                prep = prepare_execution(dec, meta, ctx)
+                if not prep:
+                    # guardrails rejected; already logged why
+                    continue
+
+                if prep["action"] == "hold":
+                    print(f"[HOLD] {sym} price={ctx['price']:.2f}")
+                    continue
+
+                if prep["action"] == "sell":
+                    ok, resp = market_sell(sym, prep["qty"])
+                    print(f"[SELL] {sym} qty={prep['qty']} price=~{ctx['price']:.2f} dry={KILL_SWITCH} resp={resp}")
+                    continue
+
+                if prep["action"] == "buy":
+                    ok, resp = market_buy(sym, prep["qty"])
+                    print(f"[BUY]  {sym} qty={prep['qty']} price=~{ctx['price']:.2f} dry={KILL_SWITCH} resp={resp}")
+                    continue
+
+            time.sleep(LOOP_SEC)
+        except requests.HTTPError as e:
+            print(f"[HTTP] {e}"); time.sleep(5)
+        except Exception as e:
+            print(f"[ERR] {type(e).__name__}: {e}"); time.sleep(5)
+
+if __name__ == "__main__":
+    main()
+
 
 
