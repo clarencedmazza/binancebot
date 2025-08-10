@@ -16,7 +16,14 @@ BUSA_API_KEY    = os.getenv("BUSA_API_KEY")
 BUSA_API_SECRET = os.getenv("BUSA_API_SECRET")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")
-STRATEGY_PROMPT = os.getenv("STRATEGY_PROMPT", "")
+def load_strategy_prompt(path="strategy_prompt.txt") -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"[FATAL] Could not read strategy prompt from {path}: {e}")
+        return ""
+STRATEGY_PROMPT = load_strategy_prompt()
 KILL_SWITCH     = os.getenv("KILL_SWITCH", "1") == "1"
 CONF_THRESHOLD  = float(os.getenv("CONF_THRESHOLD", "0.68"))
 LOOP_SEC        = int(os.getenv("LOOP_SEC", "900"))   # 15min
