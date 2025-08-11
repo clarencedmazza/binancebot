@@ -15,7 +15,7 @@ SESSION.headers.update({"User-Agent": "gpt-signal-executor/1.0"})
 BUSA_API_KEY    = os.getenv("BUSA_API_KEY")
 BUSA_API_SECRET = os.getenv("BUSA_API_SECRET")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")  # set to gpt-4 if your API access has it
+LLM_MODEL = (os.getenv("LLM_MODEL") or "gpt-4o-mini").strip()
 KILL_SWITCH     = os.getenv("KILL_SWITCH", "1") == "1"   # 1=dry-run
 CONF_THRESHOLD  = float(os.getenv("CONF_THRESHOLD", "0.68"))
 LOOP_SEC        = int(os.getenv("LOOP_SEC", "900"))      # 15 min
