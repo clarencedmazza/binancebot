@@ -1,1 +1,1 @@
-worker: python3 gpt_dual_trader.py
+worker: python3 gpt_signal_executor.py
