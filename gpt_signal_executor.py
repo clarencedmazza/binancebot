@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# GPT-driven Binance.US trader — BTCUSDT & ETHUSDT, long-only, spot.
-# Dry by default (KILL_SWITCH=1). Flip to 0 when ready.
+# GPT-signal executor for Binance.US — BTC/ETH, long-only.
+# GPT ADVISES via JSON; this bot validates & executes. Dry by default.
 
 import os, time, hmac, hashlib, json, math
 from datetime import datetime, timezone
@@ -9,29 +9,30 @@ import requests
 
 BASE = "https://api.binance.us"
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "gpt-dual-trader/1.1"})
+SESSION.headers.update({"User-Agent": "gpt-signal-executor/1.0"})
 
-# ---- Env ----
+# ---------- Env ----------
 BUSA_API_KEY    = os.getenv("BUSA_API_KEY")
 BUSA_API_SECRET = os.getenv("BUSA_API_SECRET")
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL       = os.getenv("LLM_MODEL", "gpt-4o-mini")  # set to gpt-4 if your API access has it
+KILL_SWITCH     = os.getenv("KILL_SWITCH", "1") == "1"   # 1=dry-run
+CONF_THRESHOLD  = float(os.getenv("CONF_THRESHOLD", "0.68"))
+LOOP_SEC        = int(os.getenv("LOOP_SEC", "900"))      # 15 min
+USDT_CAP        = float(os.getenv("USDT_CAP", "15000"))
+MAX_RISK_PCT    = float(os.getenv("MAX_RISK_PCT", "2.0"))
+SYMBOLS         = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
+
 def load_strategy_prompt(path="strategy_prompt.txt") -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception as e:
-        print(f"[FATAL] Could not read strategy prompt from {path}: {e}")
+        print(f"[FATAL] Could not read strategy prompt: {e}")
         return ""
 STRATEGY_PROMPT = load_strategy_prompt()
-KILL_SWITCH     = os.getenv("KILL_SWITCH", "1") == "1"
-CONF_THRESHOLD  = float(os.getenv("CONF_THRESHOLD", "0.68"))
-LOOP_SEC        = int(os.getenv("LOOP_SEC", "900"))   # 15min
-USDT_CAP        = float(os.getenv("USDT_CAP", "15000"))
-MAX_RISK_PCT    = float(os.getenv("MAX_RISK_PCT", "2.0"))
-SYMBOLS         = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
 
-# ---- Utils ----
+# ---------- Utils ----------
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -45,7 +46,7 @@ def sign(params: Dict[str, str]) -> str:
     sig = hmac.new(BUSA_API_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
     return q + f"&signature={sig}"
 
-# ---- Exchange public ----
+# ---------- Public API ----------
 def pub_get(path: str, params: Optional[Dict[str, str]] = None) -> Any:
     r = SESSION.get(BASE + path, params=params, timeout=15)
     r.raise_for_status()
@@ -65,7 +66,7 @@ def klines(symbol: str, interval: str, limit: int = 200) -> List[List]:
     limit = max(1, min(limit, 1000))
     return pub_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
-# ---- Indicators (no pandas) ----
+# ---------- Indicators (no pandas) ----------
 def ema(vals: List[float], span: int) -> Optional[float]:
     if len(vals) < span or span <= 1: return None
     k = 2.0 / (span + 1.0)
@@ -90,7 +91,7 @@ def vwap_from_klines(kl: List[List], use_len: int = 120) -> Optional[float]:
     den = sum(vols)
     return (num / den) if den > 0 else None
 
-# ---- Exchange private ----
+# ---------- Private API ----------
 def priv_request(method: str, path: str, params: Dict[str, str]) -> Tuple[int, Any]:
     if not BUSA_API_KEY or not BUSA_API_SECRET:
         return 400, {"error": "Missing API keys"}
@@ -167,21 +168,18 @@ def round_step(qty: float, step: float) -> float:
     steps = math.floor(qty / step)
     return float(f"{steps * step:.{precision}f}")
 
-# ---- LLM ----
+# ---------- LLM ----------
 def call_llm(system_prompt: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not OPENAI_API_KEY:
         print("[LLM] missing OPENAI_API_KEY")
         return None
 
-    # Clean None values before sending
+    # sanitize context (no None/NaN)
     for k, v in list(context.items()):
-        if v is None:
+        if v is None or (isinstance(v, float) and (v != v)):  # NaN check
             context[k] = "null"
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     body = {
         "model": LLM_MODEL,
         "messages": [
@@ -194,17 +192,15 @@ def call_llm(system_prompt: str, context: Dict[str, Any]) -> Optional[Dict[str, 
         r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=40)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"].strip()
-        # Extract only the JSON block if extra text appears
         raw_json = raw[raw.find("{"): raw.rfind("}")+1]
         data = json.loads(raw_json)
-        if not isinstance(data, dict):
-            return None
+        if not isinstance(data, dict): return None
         return data
     except Exception as e:
-        print(f"[LLM] parse error: {e} raw={raw if 'raw' in locals() else 'N/A'}")
+        print(f"[LLM] parse/request error: {e}")
         return None
 
-# ---- Context builder ----
+# ---------- Context ----------
 def build_context(symbol: str) -> Dict[str, Any]:
     t24 = ticker24(symbol)
     k1h = klines(symbol, "1h", 200)
@@ -232,25 +228,19 @@ def build_context(symbol: str) -> Dict[str, Any]:
         "ema50_1h": ema50_1h, "ema200_1h": ema200_1h, "ema50_4h": ema50_4h, "ema200_4h": ema200_4h,
         "vwap_1h": vwap_1h, "atr_1h": atr1h,
         "have_asset": have_asset, "have_usdt": have_usdt,
-        "dry_run": KILL_SWITCH, "ts": utcnow_iso()
+        "ts_utc": utcnow_iso()
     }
 
-# ---- Validation & execution prep ----
+# ---------- Guardrails & Sizing ----------
 def prepare_execution(dec: Dict[str, Any], meta: Dict[str, Dict[str, float]], ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # required keys
-    req = ["action","symbol","entry_type","entry_price","amount_usdt","risk_pct","stop_loss","take_profit","confidence","reason"]
+    req = ["action","symbol","entry_type","entry_price","stop_loss","take_profit","risk_pct","confidence","reason"]
     if any(k not in dec for k in req):
-        print("[GUARD] missing keys")
-        return None
+        print("[GUARD] missing keys"); return None
 
     action = str(dec["action"]).lower()
     symbol = str(dec["symbol"]).upper()
-    if symbol not in SYMBOLS:
-        print("[GUARD] symbol not allowed")
-        return None
-    if action not in ("buy","sell","hold"):
-        print("[GUARD] invalid action")
-        return None
+    if symbol not in SYMBOLS: print("[GUARD] symbol not allowed"); return None
+    if action not in ("buy","sell","hold"): print("[GUARD] invalid action"); return None
 
     conf = float(dec.get("confidence", 0.0))
     if conf < CONF_THRESHOLD:
@@ -263,12 +253,10 @@ def prepare_execution(dec: Dict[str, Any], meta: Dict[str, Dict[str, float]], ct
 
     if action == "sell":
         if (ctx["have_asset"] or 0.0) <= 0.0:
-            print("[GUARD] no holdings to sell")
-            return None
+            print("[GUARD] no holdings to sell"); return None
         qty = round_step(float(ctx["have_asset"]), step)
         if qty * price < min_notional or qty <= 0:
-            print("[GUARD] notional too small to sell")
-            return None
+            print("[GUARD] notional too small to sell"); return None
         return {"action":"sell","symbol":symbol,"qty":qty}
 
     if action == "hold":
@@ -277,62 +265,42 @@ def prepare_execution(dec: Dict[str, Any], meta: Dict[str, Dict[str, float]], ct
     # BUY checks
     stop  = float(dec["stop_loss"])
     take  = float(dec["take_profit"])
-    if stop >= price:
-        print("[GUARD] stop not below entry")
-        return None
+    if stop >= price: print("[GUARD] stop not below entry"); return None
     stop_dist_pct = (price - stop) / max(price, 1e-9) * 100.0
-    if stop_dist_pct > 3.0:
-        print(f"[GUARD] stop distance {stop_dist_pct:.2f}% > 3%")
-        return None
+    if stop_dist_pct > 3.0: print(f"[GUARD] stop distance {stop_dist_pct:.2f}% > 3%"); return None
     rr = (take - price) / max(price - stop, 1e-9)
-    if rr < 1.8:
-        print(f"[GUARD] RR {rr:.2f} < 1.8")
-        return None
+    if rr < 1.5: print(f"[GUARD] RR {rr:.2f} < 1.5"); return None
 
     # bullish regime
     if not (ctx["ema50_1h"] and ctx["ema200_1h"] and ctx["ema50_4h"] and ctx["ema200_4h"] and ctx["vwap_1h"]):
-        print("[GUARD] missing regime indicators")
-        return None
+        print("[GUARD] missing regime indicators"); return None
     if not (ctx["ema50_1h"] > ctx["ema200_1h"] and price >= ctx["vwap_1h"] and ctx["ema50_4h"] > ctx["ema200_4h"]):
-        print("[GUARD] regime not bullish")
-        return None
+        print("[GUARD] regime not bullish"); return None
 
-    # sizing
+    # size calc
     avail_usdt = float(ctx["have_usdt"])
     max_usdt = min(avail_usdt, USDT_CAP)
-    risk_pct = max(0.2, min(float(dec["risk_pct"]), MAX_RISK_PCT))  # percentage
-    amt_usdt = dec["amount_usdt"]
-
-    if amt_usdt is None:
-        risk_usdt = max_usdt * (risk_pct / 100.0)
-        risk_per_unit = price - stop
-        if risk_per_unit <= 0:
-            print("[GUARD] invalid risk per unit")
-            return None
-        qty = risk_usdt / risk_per_unit
-        # cap by max_usdt
-        qty = min(qty, max_usdt / max(price, 1e-9))
-    else:
-        qty = float(amt_usdt) / max(price, 1e-9)
-        qty = min(qty, max_usdt / max(price, 1e-9))
-
+    risk_pct = max(0.2, min(float(dec["risk_pct"]), MAX_RISK_PCT))
+    risk_usdt = max_usdt * (risk_pct / 100.0)
+    risk_per_unit = price - stop
+    if risk_per_unit <= 0: print("[GUARD] invalid risk per unit"); return None
+    qty = risk_usdt / risk_per_unit
+    qty = min(qty, max_usdt / max(price, 1e-9))
     qty = round_step(qty, step)
     if qty * price < min_notional or qty <= 0:
-        print(f"[GUARD] notional too small: qty={qty} notional={qty*price:.2f} < {min_notional}")
+        print(f"[GUARD] notional too small: qty={qty} value={qty*price:.2f} < {min_notional}")
         return None
 
     return {"action":"buy","symbol":symbol,"qty":qty}
 
-# ---- Main loop ----
+# ---------- Main ----------
 def main():
-    print(f"[BOOT] GPT trader starting — symbols={SYMBOLS} dry={KILL_SWITCH} conf>={CONF_THRESHOLD} loop={LOOP_SEC}s")
-    if not STRATEGY_PROMPT:
-        print("[FATAL] STRATEGY_PROMPT missing"); return
-    if not OPENAI_API_KEY:
-        print("[WARN] OPENAI_API_KEY missing (decisions will fail)")
+    print(f"[BOOT] GPT signal executor — symbols={SYMBOLS} dry={KILL_SWITCH} conf>={CONF_THRESHOLD} loop={LOOP_SEC}s model={LLM_MODEL}")
+    if not STRATEGY_PROMPT: print("[FATAL] Empty strategy prompt"); return
+    if not OPENAI_API_KEY: print("[WARN] OPENAI_API_KEY missing (LLM will fail)")
+
     meta = fetch_symbol_meta(SYMBOLS)
-    if not meta:
-        print("[WARN] exchange info/meta empty; will still attempt trading")
+    if not meta: print("[WARN] exchange meta empty")
 
     while True:
         try:
@@ -342,25 +310,18 @@ def main():
                 if not dec:
                     print(f"[LLM] no/invalid decision for {sym}")
                     continue
-
                 prep = prepare_execution(dec, meta, ctx)
                 if not prep:
-                    # guardrails rejected; already logged why
                     continue
 
                 if prep["action"] == "hold":
                     print(f"[HOLD] {sym} price={ctx['price']:.2f}")
-                    continue
-
-                if prep["action"] == "sell":
+                elif prep["action"] == "sell":
                     ok, resp = market_sell(sym, prep["qty"])
-                    print(f"[SELL] {sym} qty={prep['qty']} price=~{ctx['price']:.2f} dry={KILL_SWITCH} resp={resp}")
-                    continue
-
-                if prep["action"] == "buy":
+                    print(f"[SELL] {sym} qty={prep['qty']} ~{ctx['price']:.2f} dry={KILL_SWITCH} resp={resp}")
+                elif prep["action"] == "buy":
                     ok, resp = market_buy(sym, prep["qty"])
-                    print(f"[BUY]  {sym} qty={prep['qty']} price=~{ctx['price']:.2f} dry={KILL_SWITCH} resp={resp}")
-                    continue
+                    print(f"[BUY ] {sym} qty={prep['qty']} ~{ctx['price']:.2f} dry={KILL_SWITCH} resp={resp}")
 
             time.sleep(LOOP_SEC)
         except requests.HTTPError as e:
@@ -370,6 +331,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
